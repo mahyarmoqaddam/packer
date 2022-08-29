@@ -377,14 +377,6 @@ func (c *Core) Build(n string) (packersdk.Build, error) {
 					"post-processor type not found: %s", rawP.Type)
 			}
 
-			if c.Bucket != nil {
-				postProcessor = &RegistryPostProcessor{
-					BuilderType:               n,
-					ArtifactMetadataPublisher: c.Bucket,
-					PostProcessor:             postProcessor,
-				}
-			}
-
 			current = append(current, CoreBuildPostProcessor{
 				PostProcessor:     postProcessor,
 				PType:             rawP.Type,
@@ -401,26 +393,8 @@ func (c *Core) Build(n string) (packersdk.Build, error) {
 
 		postProcessors = append(postProcessors, current)
 	}
-	if c.Bucket != nil {
-		postProcessors = append(postProcessors, []CoreBuildPostProcessor{
-			{
-				PostProcessor: &RegistryPostProcessor{
-					BuilderType:               n,
-					ArtifactMetadataPublisher: c.Bucket,
-				},
-			},
-		})
-	}
 
 	// TODO hooks one day
-
-	if c.Bucket != nil {
-		builder = &RegistryBuilder{
-			Name:                      n,
-			ArtifactMetadataPublisher: c.Bucket,
-			Builder:                   builder,
-		}
-	}
 
 	// Return a structure that contains the plugins, their types, variables, and
 	// the raw builder config loaded from the json template
