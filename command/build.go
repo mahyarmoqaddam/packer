@@ -3,6 +3,7 @@ package command
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
+	"github.com/hashicorp/packer/internal/hcp"
 	"github.com/hashicorp/packer/packer"
 	"golang.org/x/sync/semaphore"
 
@@ -88,33 +90,26 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 		return ret
 	}
 
-	diags = TrySetupHCP(packerStarter)
-	ret = writeDiags(c.Ui, nil, diags)
-	if ret != 0 {
-		return ret
+	hcpHandler, err := hcp.GetOrchestrator(packerStarter)
+	if err != nil {
+		return writeDiags(c.Ui, nil, hcl.Diagnostics{
+			&hcl.Diagnostic{
+				Summary:  "HCP: initial setup failed",
+				Severity: hcl.DiagError,
+				Detail:   err.Error(),
+			},
+		})
 	}
 
-	// This build currently enforces a 1:1 mapping that one publisher can be assigned to a single packer config file.
-	// It also requires that each config type implements this ConfiguredArtifactMetadataPublisher to return a configured bucket.
-	// TODO find an option that is not managed by a globally shared Publisher.
-	ArtifactMetadataPublisher, diags := packerStarter.ConfiguredArtifactMetadataPublisher()
-	if diags.HasErrors() {
-		return writeDiags(c.Ui, nil, diags)
-	}
-
-	// We need to create a bucket and an empty iteration before we retrieve builds
-	// so that we can add the iteration ID to the build's eval context
-	if ArtifactMetadataPublisher != nil {
-		if err := ArtifactMetadataPublisher.Initialize(buildCtx); err != nil {
-			diags := hcl.Diagnostics{
-				&hcl.Diagnostic{
-					Summary:  "HCP Packer Registry iteration initialization failed",
-					Detail:   fmt.Sprintf("Failed to initialize iteration for %q\n %s", ArtifactMetadataPublisher.Slug, err),
-					Severity: hcl.DiagError,
-				},
-			}
-			return writeDiags(c.Ui, nil, diags)
-		}
+	err = hcpHandler.PopulateIteration(buildCtx)
+	if err != nil {
+		return writeDiags(c.Ui, nil, hcl.Diagnostics{
+			&hcl.Diagnostic{
+				Summary:  "HCP: populating iteration failed",
+				Severity: hcl.DiagError,
+				Detail:   err.Error(),
+			},
+		})
 	}
 
 	builds, hcpMap, diags := packerStarter.GetBuilds(packer.GetBuildsOptions{
@@ -131,21 +126,6 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 
 	if cla.Debug {
 		c.Ui.Say("Debug mode enabled. Builds will not be parallelized.")
-	}
-
-	// Now that builds have been retrieved, we can populate the iteration with
-	// the builds we expect to run.
-	if ArtifactMetadataPublisher != nil {
-		if err := ArtifactMetadataPublisher.PopulateIteration(buildCtx); err != nil {
-			diags := hcl.Diagnostics{
-				&hcl.Diagnostic{
-					Summary:  "HCP Packer Registry build initialization failed",
-					Detail:   fmt.Sprintf("Failed to initialize build for %q\n %s", ArtifactMetadataPublisher.Slug, err),
-					Severity: hcl.DiagError,
-				},
-			}
-			return writeDiags(c.Ui, nil, diags)
-		}
 	}
 
 	// Compile all the UIs for the builds
@@ -206,7 +186,7 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 		m map[string][]packersdk.Artifact
 	}{m: make(map[string][]packersdk.Artifact)}
 	// Get the builds we care about
-	var errors = struct {
+	var errs = struct {
 		sync.RWMutex
 		m map[string]error
 	}{m: make(map[string]error)}
@@ -222,9 +202,9 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 		ui := buildUis[b]
 		if err := limitParallel.Acquire(buildCtx, 1); err != nil {
 			ui.Error(fmt.Sprintf("Build '%s' failed to acquire semaphore: %s", name, err))
-			errors.Lock()
-			errors.m[name] = err
-			errors.Unlock()
+			errs.Lock()
+			errs.m[name] = err
+			errs.Unlock()
 			break
 		}
 		// Increment the waitgroup so we wait for this item to finish properly
@@ -239,19 +219,13 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 
 			defer limitParallel.Release(1)
 
-			if ArtifactMetadataPublisher != nil {
-				err := ArtifactMetadataPublisher.BuildStart(buildCtx, hcpMap[name])
-				if err != nil {
-					msg := err.Error()
-					if strings.Contains(msg, "already done") {
-						ui.Say(fmt.Sprintf(
-							"Build %q already done for bucket %q, skipping to prevent drift: %q",
-							name,
-							ArtifactMetadataPublisher.Slug,
-							err))
-						return
-					}
-
+			err := hcpHandler.BuildStart(buildCtx, hcpMap[name])
+			if err != nil {
+				if errors.As(err, &hcp.BuildDone{}) {
+					ui.Say(fmt.Sprintf(
+						"skipping HCP-enabled build %q: already done.",
+						name))
+					return
 				}
 			}
 
@@ -263,24 +237,28 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 			buildDuration := buildEnd.Sub(buildStart)
 			fmtBuildDuration := durafmt.Parse(buildDuration).LimitFirstN(2)
 
-			if ArtifactMetadataPublisher != nil {
-				runArtifacts, err = ArtifactMetadataPublisher.BuildDone(
-					buildCtx,
-					hcpMap[name],
-					runArtifacts,
-					err,
-				)
-				if err != nil {
-					ui.Error(fmt.Sprintf("failed to complete HCP build %q: %s",
-						name, err))
-				}
+			runArtifacts, hcperr := hcpHandler.BuildDone(
+				buildCtx,
+				hcpMap[name],
+				runArtifacts,
+				err)
+			if hcperr != nil {
+				writeDiags(c.Ui, nil, hcl.Diagnostics{
+					&hcl.Diagnostic{
+						Summary: fmt.Sprintf(
+							"failed to complete HCP-enabled build %q",
+							name),
+						Severity: hcl.DiagError,
+						Detail:   hcperr.Error(),
+					},
+				})
 			}
 
 			if err != nil {
 				ui.Error(fmt.Sprintf("Build '%s' errored after %s: %s", name, fmtBuildDuration, err))
-				errors.Lock()
-				errors.m[name] = err
-				errors.Unlock()
+				errs.Lock()
+				errs.m[name] = err
+				errs.Unlock()
 			} else {
 				ui.Say(fmt.Sprintf("Build '%s' finished after %s.", name, fmtBuildDuration))
 				if runArtifacts != nil {
@@ -318,11 +296,11 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 		return 1
 	}
 
-	if len(errors.m) > 0 {
-		c.Ui.Machine("error-count", strconv.FormatInt(int64(len(errors.m)), 10))
+	if len(errs.m) > 0 {
+		c.Ui.Machine("error-count", strconv.FormatInt(int64(len(errs.m)), 10))
 
 		c.Ui.Error("\n==> Some builds didn't complete successfully and had errors:")
-		for name, err := range errors.m {
+		for name, err := range errs.m {
 			// Create a UI for the machine readable stuff to be targeted
 			ui := &packer.TargetedUI{
 				Target: name,
@@ -385,7 +363,7 @@ func (c *BuildCommand) RunContext(buildCtx context.Context, cla *BuildArgs) int 
 		c.Ui.Say("\n==> Builds finished but no artifacts were created.")
 	}
 
-	if len(errors.m) > 0 {
+	if len(errs.m) > 0 {
 		// If any errors occurred, exit with a non-zero exit status
 		ret = 1
 	}
