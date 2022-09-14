@@ -18,7 +18,7 @@ type jsonOrchestrator struct {
 }
 
 func newJSONOrchestrator(config *packer.Core) (Orchestrator, error) {
-	if !env.IsPAREnabled() {
+	if env.IsPARDisabled() {
 		return newNoopHandler(), nil
 	}
 
@@ -30,6 +30,10 @@ func newJSONOrchestrator(config *packer.Core) (Orchestrator, error) {
 	}
 
 	bucket.LoadDefaultSettingsFromEnv()
+
+	if bucket.Slug == "" {
+		return newNoopHandler(), nil
+	}
 
 	return &jsonOrchestrator{
 		configuration: config,

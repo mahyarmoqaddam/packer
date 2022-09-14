@@ -162,19 +162,19 @@ func newHCLOrchestrator(config *hcl2template.PackerConfig) (Orchestrator, error)
 		}
 	}
 
-	if hasHCP && len(config.Builds) > 1 {
-		return nil, fmt.Errorf("For Packer Registry enabled builds, only one " + buildLabel +
-			" block can be defined. Please remove any additional " + buildLabel +
-			" block(s). If this " + buildLabel + " is not meant for the Packer registry please " +
-			"clear any HCP_PACKER_* environment variables or `hcp_packer_registry` block.")
-	}
-
-	if env.IsPAREnabled() {
-		hasHCP = true
+	if env.IsPARDisabled() {
+		hasHCP = false
 	}
 
 	if !hasHCP {
 		return newNoopHandler(), nil
+	}
+
+	if len(config.Builds) > 1 {
+		return nil, fmt.Errorf("For Packer Registry enabled builds, only one " + buildLabel +
+			" block can be defined. Please remove any additional " + buildLabel +
+			" block(s). If this " + buildLabel + " is not meant for the Packer registry please " +
+			"clear any HCP_PACKER_* environment variables or `hcp_packer_registry` block.")
 	}
 
 	bucket, err := registry.NewBucketWithIteration(registry.IterationOptions{

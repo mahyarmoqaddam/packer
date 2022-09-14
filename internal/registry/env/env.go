@@ -35,7 +35,7 @@ func HasHCPCredentials() bool {
 	return true
 }
 
-func IsPAREnabled() bool {
+func IsPARDisabled() bool {
 	val, ok := os.LookupEnv(HCPPackerRegistry)
-	return ok && strings.ToLower(val) != "off" && val != "0"
+	return ok && strings.ToLower(val) == "off" && val == "0"
 }
